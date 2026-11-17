@@ -26,6 +26,27 @@ TUPLE_FIELDS = (
 )
 
 
+# ---------------------------------------------------------------- 发布水位
+
+def published_watermarks(conn, rule_version: int) -> dict[tuple[str, str], str]:
+    """同一规则版本下每个 (检测项, 分组) 已发布过的最晚窗口起点。
+
+    水位直接来自已提交的实时检测明细，因此天然跨任务、跨进程重启持久：
+    - 只有 ``kind='realtime'`` 的结果计入，历史复核不会影响现场发布；
+    - 同一规则版本 + 检测项 + 分组内，窗口起点一旦发布就不再回退。
+    """
+    rows = conn.execute(
+        "SELECT dr.item AS item, dr.group_key AS group_key, "
+        "MAX(dr.window_start) AS watermark "
+        "FROM detection_results dr "
+        "JOIN detection_jobs dj ON dj.id = dr.job_id "
+        "WHERE dj.kind='realtime' AND dj.rule_version=? "
+        "GROUP BY dr.item, dr.group_key",
+        (rule_version,),
+    ).fetchall()
+    return {(r["item"], r["group_key"]): r["watermark"] for r in rows}
+
+
 # ---------------------------------------------------------------- 数据读取
 
 def load_effective(conn, seq_cap: int, farm_id: str) -> list[dict]:
@@ -251,16 +272,37 @@ def _sample_measurement(rec: dict) -> dict:
 def run_windows(grouped: dict[str, dict[float, list[dict]]],
                 rules: list[CompiledRule], items: dict[str, dict],
                 cfg_thresholds: dict, min_samples: int, baseline_windows: int,
-                max_violation_samples: int, minutes: int = WINDOW_MINUTES):
+                max_violation_samples: int, minutes: int = WINDOW_MINUTES,
+                emit_start: str | None = None, emit_end: str | None = None,
+                watermarks: dict[tuple[str, str], str] | None = None):
     """按窗口时间顺序产出 (window_start, window_end, group_key, item, status,
     score, threshold, detail, violation_samples)。
 
     ``items``: {item_name: {"threshold": float}}，规则项名 rule:<id>。
     基线 = 同分组此前连续 baseline_windows 个窗口的样本合并。
+
+    基线始终由全量窗口累积（不受 emit_start/watermarks 影响），因此“只发布
+    新窗口”不会截断漂移基线。是否发布由三件事共同决定：
+
+    - ``emit_start`` / ``emit_end``：发布区间，左闭右开（实时任务的时间范围）；
+    - ``watermarks``：{(检测项, 分组): 已发布过的最晚窗口起点}，只发布严格
+      晚于水位的窗口，保证跨任务、重启后仍只向前推进；
+    - 历史复核传 ``watermarks=None``，按区间完整重算，不触碰现场发布。
     """
     history: dict[str, deque] = {}
     group_names = sorted(grouped)
     all_window_epochs = sorted({w for g in grouped.values() for w in g})
+
+    def _should_emit(item_name: str, gk: str, ws_iso: str) -> bool:
+        if emit_start is not None and ws_iso < emit_start:
+            return False
+        if emit_end is not None and ws_iso >= emit_end:
+            return False
+        if watermarks is not None:
+            wm = watermarks.get((item_name, gk))
+            if wm is not None and ws_iso <= wm:
+                return False
+        return True
 
     for w_epoch in all_window_epochs:
         from datetime import datetime, timedelta, timezone
@@ -280,6 +322,8 @@ def run_windows(grouped: dict[str, dict[float, list[dict]]],
             hist.append(current)
 
             for item_name, spec in items.items():
+                if not _should_emit(item_name, gk, ws_iso):
+                    continue
                 threshold = spec.get("threshold")
                 if threshold is None:
                     threshold = cfg_thresholds.get(

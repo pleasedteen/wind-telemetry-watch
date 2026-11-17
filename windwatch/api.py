@@ -10,8 +10,20 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .common import utc_now_iso
+from .common import iso, parse_instant, utc_now_iso
 from .rules import RuleValidationError, compile_rules
+
+
+def _normalize_window(value, field: str) -> str | None:
+    """把可选的窗口边界规范为 UTC ISO 文本（与结果窗口键同格式可比）。"""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} 必须是带时区的 ISO-8601 字符串")
+    try:
+        return iso(parse_instant(value))
+    except ValueError as exc:
+        raise ValueError(f"{field} 无法解析: {exc}")
 
 
 def _create_detection(db, payload: dict) -> tuple[int, int, str]:
@@ -29,6 +41,10 @@ def _create_detection(db, payload: dict) -> tuple[int, int, str]:
         cap = conn.execute(
             "SELECT COALESCE(MAX(ingest_seq),0) AS s FROM measurements"
         ).fetchone()["s"]
+    window_start = _normalize_window(payload.get("window_start"), "window_start")
+    window_end = _normalize_window(payload.get("window_end"), "window_end")
+    if window_start and window_end and window_start >= window_end:
+        raise ValueError("window_start 必须早于 window_end")
     now = utc_now_iso()
     with db.transaction() as conn:
         cur = conn.execute(
@@ -38,7 +54,7 @@ def _create_detection(db, payload: dict) -> tuple[int, int, str]:
             "RETURNING id",
             (kind, "queued", payload["farm_id"], payload["group_mode"],
              int(payload["rule_version"]), int(cap),
-             payload.get("window_start"), payload.get("window_end"),
+             window_start, window_end,
              json.dumps(payload["items"], ensure_ascii=False), now, now),
         )
         return cur.fetchone()["id"], int(cap), kind
@@ -334,9 +350,10 @@ def make_handler(db, cfg):
                 "SELECT dr.window_start, dr.window_end, dr.item, dr.status, "
                 "dr.score, dr.threshold FROM detection_results dr "
                 "JOIN detection_jobs dj ON dr.job_id=dj.id "
-                "WHERE dj.kind='realtime' AND dr.group_key=? AND dr.item=? "
+                "WHERE dj.kind='realtime' AND dj.rule_version=? "
+                "AND dr.group_key=? AND dr.item=? "
                 "AND dr.window_end >= ? ORDER BY dr.window_start",
-                (alert["group_key"], alert["item"],
+                (alert["rule_version"], alert["group_key"], alert["item"],
                  alert["opened_window_end"]),
             ).fetchall()
             notifs = conn.execute(

@@ -118,6 +118,9 @@ CREATE TABLE IF NOT EXISTS detection_results (
 
 CREATE INDEX IF NOT EXISTS idx_dr_lookup
     ON detection_results(group_key, item, window_start);
+-- 实时发布水位查询：按检测项×分组取已发布的最晚窗口起点
+CREATE INDEX IF NOT EXISTS idx_dr_publish
+    ON detection_results(item, group_key, window_start);
 
 -- 规则违反样本（少量、带表达式失败位置）
 CREATE TABLE IF NOT EXISTS violation_samples (

@@ -11,8 +11,9 @@ import time
 from typing import Callable
 
 from .alerts import AlertManager
-from .common import row_hash, utc_now_iso, validate_measurement
-from .detection import load_effective, organize, run_windows
+from .common import iso, parse_instant, row_hash, utc_now_iso, validate_measurement
+from .detection import (load_effective, organize, published_watermarks,
+                        run_windows)
 from .rules import CompiledRule, RuleValidationError, compile_rules
 
 
@@ -201,6 +202,8 @@ class Worker:
                     spec["threshold"] = self.cfg.rule_threshold
 
             records = load_effective(conn, job["seq_cap"], job["farm_id"])
+            emit_start = emit_end = None
+            watermarks = None
             if job["kind"] == "review":
                 from .common import window_start_for
                 start = _parse_epoch(job["window_start"])
@@ -212,6 +215,13 @@ class Worker:
                         r["measured_epoch"], self.cfg.window_minutes
                     ).timestamp() < end
                 ]
+            else:
+                # 实时发布：指定的时间范围只限制“发布哪些窗口”，
+                # 数据仍全量读取，基线由完整历史累积，不因范围而截断。
+                if job["window_start"]:
+                    emit_start = iso(parse_instant(job["window_start"]))
+                if job["window_end"]:
+                    emit_end = iso(parse_instant(job["window_end"]))
             grouped = organize(records, job["group_mode"], self.cfg.window_minutes)
 
             alert_mgr = AlertManager(conn, self.cfg.notify_reminder_seconds)
@@ -224,11 +234,17 @@ class Worker:
                 "__rule_default__": self.cfg.rule_threshold,
             }
             with self.db.transaction() as conn:
+                if job["kind"] != "review":
+                    # 与结果插入同一写事务读取发布水位：全局写锁 + BEGIN IMMEDIATE
+                    # 保证并发检测（含多进程）看到已提交的最新水位，不会重复发布。
+                    watermarks = published_watermarks(conn, job["rule_version"])
                 for (ws, we, gk, item, status, score, threshold,
                      detail, samples) in run_windows(
                         grouped, rules, items, thresholds,
                         self.cfg.min_samples, self.cfg.baseline_windows,
                         self.cfg.max_violation_samples, self.cfg.window_minutes,
+                        emit_start=emit_start, emit_end=emit_end,
+                        watermarks=watermarks,
                 ):
                     cur = conn.execute(
                         "INSERT INTO detection_results(job_id, window_start, "

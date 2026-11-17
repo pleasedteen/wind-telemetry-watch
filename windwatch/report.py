@@ -22,24 +22,30 @@ def build_review_report(conn, job, records, grouped, rules, rule_map,
     ).fetchall()
 
     # 原实时结果：同风场的实时任务，按 (窗口, 分组, 检测项) 对齐。
-    # 复核常使用不同规则版本，因此这里不限制 rule_version。
+    # 优先同一规则版本的现场结果；复核常用不同规则版本时回退到最早任务，
+    # 保持报告可解释。实时结果自身已只向前发布，同一键不会重复。
     realtime = {}
     rt_jobs = [
-        r["id"] for r in conn.execute(
-            "SELECT id FROM detection_jobs WHERE kind='realtime' AND farm_id=? "
-            "ORDER BY id",
+        dict(r) for r in conn.execute(
+            "SELECT id, rule_version FROM detection_jobs "
+            "WHERE kind='realtime' AND farm_id=? ORDER BY id",
             (job["farm_id"],),
         ).fetchall()
     ]
     if rt_jobs:
         placeholders = ",".join("?" * len(rt_jobs))
+        order = {r["id"]: r["rule_version"] for r in rt_jobs}
         old = conn.execute(
             f"SELECT * FROM detection_results WHERE job_id IN ({placeholders})",
-            rt_jobs,
+            [r["id"] for r in rt_jobs],
         ).fetchall()
-        for r in old:
+        # 同版本优先：先放入同版本结果，再用 setdefault 保留最早发布。
+        same = sorted(
+            old, key=lambda r: (order[r["job_id"]] != job["rule_version"],
+                                r["job_id"], r["id"]))
+        for r in same:
             key = (r["window_start"], r["window_end"], r["group_key"], r["item"])
-            realtime.setdefault(key, r)  # 最早任务为准
+            realtime.setdefault(key, r)
 
     per_window: dict[str, list] = defaultdict(list)
     new_issues, gone_issues, persistent_issues = [], [], []
