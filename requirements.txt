@@ -1,0 +1,5 @@
+# 运行时零第三方依赖：仅使用 Python 3.11 标准库
+# （http.server / sqlite3 / urllib / threading / json / math / datetime）
+#
+# 测试与开发依赖：
+pytest>=8.0

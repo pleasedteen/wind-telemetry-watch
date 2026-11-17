@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windwatch"
+version = "1.0.0"
+description = "风电场遥测质量监控服务：批次接收、PSI/TVD 漂移检测、规则引擎、告警生命周期与历史复核"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+windwatch = "windwatch.cli:main"
+
+[tool.setuptools]
+packages = ["windwatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
